@@ -1,0 +1,233 @@
+let ws = null;
+let roomKey = null;
+let roomCode = null;
+let alias = null;
+
+function bytesToBase64(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+}
+function base64ToBytes(b64) {
+    return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+function generateRoomCode() {
+    return Math.random().toString(36).slice(2, 10);
+}
+
+async function encryptText(key, message) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = new TextEncoder().encode(message);
+    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
+    return { ciphertext: bytesToBase64(new Uint8Array(encrypted)), iv: bytesToBase64(iv) };
+}
+
+async function decryptText(key, ciphertext, iv) {
+    const decrypted = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: base64ToBytes(iv) },
+        key,
+        base64ToBytes(ciphertext)
+    );
+    return new TextDecoder().decode(decrypted);
+}
+
+function connectSocket() {
+    ws = new WebSocket(`ws://127.0.0.1:9000/ws/${roomCode}`);
+
+    ws.onmessage = async e => {
+        const data = JSON.parse(e.data);
+
+        if (data.type === "system") {
+            addSystemMessage(data.text);
+            return;
+        }
+
+        if (data.type === "count") {
+            document.getElementById("participantCount").innerText =
+                data.value + " participant" + (data.value === 1 ? "" : "s") + " connected";
+            return;
+        }
+
+        if (data.type === "file") {
+            receiveFile(data);
+            return;
+        }
+
+        const decrypted = await decryptText(roomKey, data.ciphertext, data.iv);
+        const payload = JSON.parse(decrypted);
+        appendMessage(payload.sender, payload.text, false);
+    };
+}
+
+function appendMessage(sender, text, mine) {
+    const box = document.getElementById("messages");
+    const wrap = document.createElement("div");
+    wrap.className = mine ? "msg mine" : "msg theirs";
+
+    const name = document.createElement("div");
+    name.className = "alias";
+    name.innerText = sender;
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerText = text;
+
+    wrap.appendChild(name);
+    wrap.appendChild(bubble);
+    box.appendChild(wrap);
+    box.scrollTop = box.scrollHeight;
+}
+
+function addSystemMessage(text) {
+    const box = document.getElementById("messages");
+    const div = document.createElement("div");
+    div.className = "text-center text-gray-500 text-xs my-3";
+    div.innerText = "— " + text + " —";
+    box.appendChild(div);
+}
+
+async function sendMessage() {
+    if (!ws || ws.readyState !== 1) return;
+
+    const input = document.getElementById("msgInput");
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    const payload = { sender: alias, text: msg };
+    const encrypted = await encryptText(roomKey, JSON.stringify(payload));
+
+    ws.send(JSON.stringify(encrypted));
+    appendMessage(alias, msg, true);
+    input.value = "";
+}
+
+async function encryptFile(file) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const buffer = await file.arrayBuffer();
+    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, roomKey, buffer);
+    return { blob: new Blob([encrypted]), iv: bytesToBase64(iv), name: file.name };
+}
+
+async function sendFile() {
+    const file = document.getElementById("fileInput").files[0];
+    if (!file) return;
+
+    const enc = await encryptFile(file);
+    const form = new FormData();
+    form.append("file", enc.blob);
+
+    const res = await fetch("/upload", { method: "POST", body: form });
+    const { url } = await res.json();
+
+    const payload = {
+        type: "file",
+        sender: alias,
+        name: enc.name,
+        iv: enc.iv,
+        url: url
+    };
+
+    ws.send(JSON.stringify(payload));
+    receiveFile(payload);
+
+}
+
+function receiveFile(data) {
+    const box = document.getElementById("messages");
+
+    const mine = data.sender === alias;
+
+    const wrap = document.createElement("div");
+    wrap.className = mine ? "msg mine" : "msg theirs";
+
+    const name = document.createElement("div");
+    name.className = "alias";
+    name.innerText = data.sender || "Someone";
+
+    const card = document.createElement("div");
+    card.className = "bubble";
+    card.innerHTML = `
+        <div class="text-sm mb-1">${data.name}</div>
+        <button class="bg-accent px-3 py-1 rounded text-xs">Download</button>
+    `;
+
+    card.querySelector("button").onclick = async () => {
+        const res = await fetch(data.url);
+        const buf = await res.arrayBuffer();
+
+        const decrypted = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: base64ToBytes(data.iv) },
+            roomKey,
+            buf
+        );
+
+        const blob = new Blob([decrypted]);
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = data.name;
+        a.click();
+    };
+
+    wrap.appendChild(name);
+    wrap.appendChild(card);
+    box.appendChild(wrap);
+    box.scrollTop = box.scrollHeight;
+}
+
+
+async function createRoom() {
+    showChat();
+    alias = prompt("Enter your alias");
+    if (!alias) return;
+
+    roomCode = generateRoomCode();
+    roomKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", roomKey));
+    const keyB64 = bytesToBase64(raw);
+
+    const link = `${location.origin}/?room=${roomCode}#${keyB64}`;
+    history.replaceState({}, "", link);
+    document.getElementById("shareLink").innerText = link;
+    document.getElementById("shareLinkModal").innerText = link;
+
+    connectSocket();
+}
+
+async function autoJoin() {
+    const params = new URLSearchParams(location.search);
+    const hash = location.hash.slice(1);
+    if (!params.has("room") || !hash) return;
+
+    showChat();
+    alias = prompt("Enter your alias");
+    if (!alias) return;
+
+    roomCode = params.get("room");
+    roomKey = await crypto.subtle.importKey("raw", base64ToBytes(hash), { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+
+    document.getElementById("shareLink").innerText = location.href;
+    document.getElementById("shareLinkModal").innerText = location.href;
+
+    connectSocket();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById("createBtn")?.addEventListener("click", createRoom);
+    document.getElementById("sendBtn")?.addEventListener("click", sendMessage);
+    const msgInput = document.getElementById("msgInput");
+    if (msgInput) {
+        msgInput.addEventListener("keydown", e => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+    }
+    const fileBtn = document.getElementById("fileBtn");
+    const fileInput = document.getElementById("fileInput");
+    if (fileBtn && fileInput) {
+        fileBtn.onclick = () => fileInput.click();
+        fileInput.onchange = sendFile;
+    }
+
+    autoJoin();
+});
