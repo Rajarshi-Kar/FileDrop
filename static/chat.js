@@ -2,6 +2,8 @@ let ws = null;
 let roomKey = null;
 let roomCode = null;
 let alias = null;
+let messageCount = 0;
+let pendingFile = null;
 
 function bytesToBase64(bytes) {
     return btoa(String.fromCharCode(...bytes));
@@ -30,10 +32,49 @@ async function decryptText(key, ciphertext, iv) {
 }
 
 function connectSocket() {
-    ws = new WebSocket(`ws://127.0.0.1:9000/ws/${roomCode}`);
+    ws = new WebSocket("wss://rypo8sd6h9.execute-api.us-east-1.amazonaws.com/prod?room=" + roomCode);
 
     ws.onmessage = async e => {
+        if (data.presignUrl && pendingFile) {
+            await fetch(data.presignUrl, {
+                method: "PUT",
+                body: pendingFile.blob
+            });
+
+            const payload = {
+                type: "file",
+                sender: alias,
+                name: pendingFile.name,
+                iv: pendingFile.iv,
+                key: pendingFile.fileKey,
+                url: data.fileUrl
+            };
+
+            ws.send(JSON.stringify(payload));
+            receiveFile(payload);
+
+            pendingFile = null;
+            return;
+        }
+
         const data = JSON.parse(e.data);
+        if (data.type === "rotate") {
+            const decrypted = await decryptText(roomKey, data.ciphertext, data.iv);
+            const raw = base64ToBytes(decrypted);
+
+            roomKey = await crypto.subtle.importKey(
+                "raw",
+                raw,
+                { name: "AES-GCM" },
+                true,
+                ["encrypt", "decrypt"]
+            );
+            return;
+        }
+
+        if (data.url) {
+            fetch(data.url, { method: "PUT", body: enc.blob });
+        }
 
         if (data.type === "system") {
             addSystemMessage(data.text);
@@ -95,40 +136,55 @@ async function sendMessage() {
     const encrypted = await encryptText(roomKey, JSON.stringify(payload));
 
     ws.send(JSON.stringify(encrypted));
+    messageCount++;
+    if (messageCount >= 20){
+        rotateKey();
+        messageCount = 0;
+    }
     appendMessage(alias, msg, true);
     input.value = "";
 }
 
 async function encryptFile(file) {
+    const fileKey = await crypto.subtle.generateKey(
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+    );
+
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const buffer = await file.arrayBuffer();
-    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, roomKey, buffer);
-    return { blob: new Blob([encrypted]), iv: bytesToBase64(iv), name: file.name };
+
+    const encrypted = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv },
+        fileKey,
+        buffer
+    );
+
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
+    const encKey = await encryptText(roomKey, bytesToBase64(raw));
+
+    return {
+        blob: new Blob([encrypted]),
+        iv: bytesToBase64(iv),
+        fileKey: encKey,
+        name: file.name
+    };
 }
+
 
 async function sendFile() {
     const file = document.getElementById("fileInput").files[0];
     if (!file) return;
 
-    const enc = await encryptFile(file);
-    const form = new FormData();
-    form.append("file", enc.blob);
+    pendingFile = await encryptFile(file);
 
-    const res = await fetch("/upload", { method: "POST", body: form });
-    const { url } = await res.json();
-
-    const payload = {
-        type: "file",
-        sender: alias,
-        name: enc.name,
-        iv: enc.iv,
-        url: url
-    };
-
-    ws.send(JSON.stringify(payload));
-    receiveFile(payload);
-
+    ws.send(JSON.stringify({
+        type: "presign",
+        name: pendingFile.name
+    }));
 }
+
 
 function receiveFile(data) {
     const box = document.getElementById("messages");
@@ -153,11 +209,22 @@ function receiveFile(data) {
         const res = await fetch(data.url);
         const buf = await res.arrayBuffer();
 
-        const decrypted = await crypto.subtle.decrypt(
-            { name: "AES-GCM", iv: base64ToBytes(data.iv) },
-            roomKey,
-            buf
-        );
+    const rawKey = await decryptText(roomKey, data.key.ciphertext, data.key.iv);
+
+    const fileKey = await crypto.subtle.importKey(
+        "raw",
+        base64ToBytes(rawKey),
+        { name: "AES-GCM" },
+        true,
+        ["decrypt"]
+    );
+
+    const decrypted = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: base64ToBytes(data.iv) },
+        fileKey,
+        buf
+    );
+
 
         const blob = new Blob([decrypted]);
         const a = document.createElement("a");
@@ -172,6 +239,26 @@ function receiveFile(data) {
     box.scrollTop = box.scrollHeight;
 }
 
+async function rotateKey() {
+    const newKey = await crypto.subtle.generateKey(
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+    );
+
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", newKey));
+    const newKeyB64 = bytesToBase64(raw);
+
+    const encrypted = await encryptText(roomKey, newKeyB64);
+
+    ws.send(JSON.stringify({
+        type: "rotate",
+        ciphertext: encrypted.ciphertext,
+        iv: encrypted.iv
+    }));
+
+    roomKey = newKey;
+}
 
 async function createRoom() {
     showChat();
